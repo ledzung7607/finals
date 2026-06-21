@@ -1,0 +1,18 @@
+from google.colab import drive
+drive.mount('/content/drive')
+
+import os, json
+
+DATA_DIR = "/content/drive/MyDrive/cuối kì"
+
+class_names = sorted([
+    name for name in os.listdir(DATA_DIR)
+    if os.path.isdir(os.path.join(DATA_DIR, name))
+])
+
+print(class_names)
+
+with open("/content/drive/MyDrive/class_names.json", "w", encoding="utf-8") as f:
+    json.dump(class_names, f, ensure_ascii=False, indent=2)
+
+print("Đã lưu class_names.json")
