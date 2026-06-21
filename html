@@ -1,0 +1,343 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>genCooky POS - Camera AI</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap" rel="stylesheet">
+<link href='https://unpkg.com/boxicons@2.1.4/css/boxicons.min.css' rel='stylesheet'>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+:root { --primary: #f97316; --surface: #ffffff; --bg: #f8fafc; --text: #0f172a; --text-secondary: #64748b; --border: #e2e8f0; --radius-md: 16px; --radius-lg: 24px; }
+body { font-family: 'Inter', sans-serif; background: var(--bg); color: var(--text); overflow-x: hidden; height: 100vh; display: flex; flex-direction: column; }
+
+/* =========================================
+   GIAO DIỆN LOGIN CHIA ĐÔI MÀN HÌNH (CÓ PHẦN GIỚI THIỆU)
+========================================= */
+#loginScreen { 
+    position: fixed; inset: 0; z-index: 9999;
+    display: flex; background: var(--surface);
+    transition: opacity 0.5s ease, visibility 0.5s;
+}
+
+/* Nửa bên trái: Hình nền và Giới thiệu */
+.login-intro {
+    flex: 1.2; /* Chiếm nhiều không gian hơn một chút */
+    background: linear-gradient(to right, rgba(249, 115, 22, 0.85), rgba(67, 20, 7, 0.9)), url('https://images.unsplash.com/photo-1504674900247-0877df9cc836?q=80&w=2070&auto=format&fit=crop');
+    background-size: cover; 
+    background-position: center;
+    display: flex; flex-direction: column; justify-content: center;
+    padding: 60px; color: white;
+}
+.login-intro i { font-size: 72px; margin-bottom: 24px; color: #fff; text-shadow: 0 4px 15px rgba(0,0,0,0.2); }
+.login-intro h1 { font-size: 48px; font-weight: 900; margin-bottom: 20px; line-height: 1.2; }
+.login-intro p { font-size: 18px; line-height: 1.6; opacity: 0.9; max-width: 500px; font-weight: 500;}
+
+/* Nửa bên phải: Form đăng nhập */
+.login-form-area {
+    width: 480px; display: flex; align-items: center; justify-content: center;
+    padding: 40px; background: var(--surface);
+}
+.login-card { width: 100%; text-align: center; }
+.login-card h2 { font-weight: 900; color: #431407; margin-bottom: 5px; font-size: 28px; }
+.login-card p { color: var(--text-secondary); margin-bottom: 30px; font-weight: 500; }
+.input-group { text-align: left; margin-bottom: 20px; }
+.input-group label { display: block; font-weight: 700; margin-bottom: 8px; font-size: 14px; color: #431407; }
+.input-group input { width: 100%; padding: 14px 16px; border: 2px solid var(--border); border-radius: 12px; font-size: 16px; font-family: 'Inter', sans-serif; outline: none; transition: 0.2s; background: var(--bg);}
+.input-group input:focus { border-color: var(--primary); box-shadow: 0 0 0 4px rgba(249, 115, 22, 0.15); background: #fff;}
+.btn-login { width: 100%; padding: 16px; background: linear-gradient(135deg, #fb923c, #ea580c); color: white; border: none; border-radius: 12px; font-weight: 800; font-size: 16px; cursor: pointer; transition: 0.2s; margin-top: 10px; box-shadow: 0 4px 15px rgba(234,88,12,0.3);}
+.btn-login:hover { transform: translateY(-2px); box-shadow: 0 6px 20px rgba(234,88,12,0.4); }
+
+/* Thu gọn hình nền giới thiệu nếu mở trên điện thoại */
+@media (max-width: 768px) {
+    .login-intro { display: none; }
+    .login-form-area { width: 100%; }
+}
+
+/* =========================================
+   GIAO DIỆN APP CHÍNH (SIDEBAR & TOPBAR)
+========================================= */
+#appLayout { 
+    display: none; width: 100%; height: 100vh; 
+    opacity: 0; transition: opacity 0.5s ease;
+}
+.sidebar { width: 260px; background: var(--surface); border-right: 1px solid var(--border); display: flex; flex-direction: column; padding: 20px 0;}
+.sidebar .logo { padding: 0 24px 30px; color: var(--primary); font-size: 24px; font-weight: 900; display: flex; align-items: center; gap: 10px; border-bottom: 1px solid var(--border); margin-bottom: 20px;}
+.menu-list { list-style: none; padding: 0 16px; flex: 1; }
+.menu-item { display: flex; align-items: center; gap: 12px; padding: 14px 16px; color: var(--text-secondary); font-weight: 600; border-radius: 12px; margin-bottom: 8px; cursor: pointer; transition: 0.2s; }
+.menu-item i { font-size: 20px; }
+.menu-item:hover { background: var(--bg); color: var(--text); transform: translateX(4px);}
+.menu-item.active { background: #fff7ed; color: var(--primary); }
+.menu-item.logout { color: #dc2626; margin-top: auto; }
+.menu-item.logout:hover { background: #fef2f2; }
+
+.main-wrapper { flex: 1; display: flex; flex-direction: column; overflow: hidden; background: var(--bg); }
+.top-bar { background: var(--surface); padding: 16px 32px; border-bottom: 1px solid var(--border); display: flex; align-items: center; justify-content: space-between; }
+.top-bar .page-title { font-size: 20px; font-weight: 800; }
+.top-bar .right-info { display: flex; align-items: center; gap: 20px; font-weight: 600; color: var(--text-secondary); }
+.clock { background: #f1f5f9; padding: 8px 16px; border-radius: 8px; font-family: monospace; font-size: 16px; font-weight: 700; color: #0f172a; }
+.cashier-info { display: flex; align-items: center; gap: 8px; }
+.cashier-info img { width: 32px; height: 32px; border-radius: 50%; background: #e2e8f0; border: 2px solid var(--primary);}
+
+.main-content { flex: 1; padding: 32px; max-width: 1000px; margin: 0 auto; width: 100%; overflow-y: auto; }
+.card { background: var(--surface); padding: 32px; border-radius: var(--radius-lg); margin-bottom: 24px; border: 1px solid var(--border); box-shadow: 0 4px 20px rgba(0,0,0,0.03); animation: fadeIn 0.4s ease;}
+@keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+
+/* =========================================
+   GIAO DIỆN QUÉT CAMERA & KẾT QUẢ (GIỮ NGUYÊN)
+========================================= */
+.camera-box { width: 100%; height: auto; border: 3px solid var(--border); border-radius: var(--radius-md); background: #000; position: relative; overflow: hidden; margin-bottom: 24px; display: flex; justify-content: center; align-items: center;}
+#videoElement { width: 100%; height: auto; max-height: 550px; display: block; }
+.camera-overlay { position: absolute; inset: 0; border: 4px solid transparent; transition: 0.3s; pointer-events: none; }
+.camera-box.scanning .camera-overlay { border-color: #22c55e; background: rgba(34, 197, 94, 0.1); }
+
+.btn-main { width: 100%; padding: 18px; border: none; border-radius: var(--radius-md); background: linear-gradient(135deg, #fb923c, #ea580c); color: white; font-weight: 800; cursor: pointer; font-size: 16px; display: flex; justify-content: center; align-items: center; gap: 8px; transition: 0.2s; box-shadow: 0 4px 15px rgba(234,88,12,0.2);}
+.btn-main:disabled { opacity: 0.7; cursor: not-allowed; }
+.btn-main:hover:not(:disabled) { box-shadow: 0 6px 20px rgba(234,88,12,0.4); transform: translateY(-2px);}
+.btn-main:active:not(:disabled) { transform: scale(0.98); }
+
+.crop-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 16px; margin-bottom: 30px; padding-bottom: 30px; border-bottom: 2px dashed var(--border); }
+.crop-item { border: 2px solid var(--border); border-radius: 12px; padding: 10px; text-align: center; background: #fff; transition: 0.3s;}
+.crop-item:hover { transform: translateY(-4px); box-shadow: 0 10px 15px -3px rgba(0,0,0,0.1); border-color: var(--primary);}
+.crop-item img { width: 100%; height: 100px; object-fit: cover; border-radius: 8px; margin-bottom: 10px; border: 1px solid #f1f5f9; }
+.crop-title { font-size: 14px; font-weight: 800; color: var(--text); }
+.crop-conf { font-size: 12px; color: #166534; font-weight: 600; margin-top: 4px; }
+.crop-price { color: var(--primary); font-weight: 800; font-size: 14px; margin-top: 6px; }
+
+.amount { font-size: 48px; font-weight: 900; color: #ea580c; text-align: center; margin: 10px 0;}
+
+.qr-section { margin-top: 30px; border-top: 2px dashed var(--border); padding-top: 30px; display: flex; align-items: center; justify-content: center; gap: 24px; background: #fff7ed; border-radius: 16px; padding: 24px;}
+.qr-img { width: 140px; height: 140px; border-radius: 12px; border: 3px solid white; box-shadow: 0 4px 15px rgba(0,0,0,0.1); object-fit: cover; }
+.qr-info h4 { font-size: 18px; font-weight: 900; color: #431407; margin-bottom: 6px; }
+.qr-info p { font-size: 14px; color: var(--text-secondary); line-height: 1.5; font-weight: 500; }
+</style>
+</head>
+<body>
+
+    <div id="loginScreen">
+        <div class="login-intro">
+            <div>
+                <i class='bx bx-restaurant'></i>
+                <h1>genCooky AI<br>Smart Canteen</h1>
+                <p>Hệ thống nhận diện khay ăn và tự động tính tiền bằng Trí tuệ nhân tạo. Tối ưu hóa thời gian chờ, nâng cao trải nghiệm khách hàng tại canteen.</p>
+            </div>
+        </div>
+        
+        <div class="login-form-area">
+            <div class="login-card">
+                <h2>Đăng nhập</h2>
+                <p>Vui lòng nhập thông tin ca làm việc</p>
+                
+                <form onsubmit="handleLogin(event)">
+                    <div class="input-group">
+                        <label>Tên Thu ngân</label>
+                        <input type="text" id="username" placeholder="Nhập tên đăng nhập..." required value="ThuNgan_01">
+                    </div>
+                    <div class="input-group">
+                        <label>Mã PIN</label>
+                        <input type="password" id="password" placeholder="••••••••" required value="123456">
+                    </div>
+                    <button type="submit" class="btn-login">VÀO CA LÀM VIỆC <i class='bx bx-right-arrow-alt'></i></button>
+                </form>
+            </div>
+        </div>
+    </div>
+
+    <div id="appLayout">
+        
+        <div class="sidebar">
+            <div class="logo"><i class='bx bx-restaurant'></i> genCooky</div>
+            <ul class="menu-list">
+                <li class="menu-item active"><i class='bx bx-scan'></i> Quét AI</li>
+                <li class="menu-item"><i class='bx bx-receipt'></i> Hóa đơn hôm nay</li>
+                <li class="menu-item"><i class='bx bx-bar-chart-alt-2'></i> Thống kê</li>
+                <li class="menu-item"><i class='bx bx-cog'></i> Cài đặt</li>
+                <div style="height: 40px;"></div>
+                <li class="menu-item logout" onclick="handleLogout()"><i class='bx bx-log-out-circle'></i> Đăng xuất</li>
+            </ul>
+        </div>
+
+        <div class="main-wrapper">
+            <div class="top-bar">
+                <div class="page-title">Máy Quét Thanh Toán</div>
+                <div class="right-info">
+                    <div class="clock" id="realtimeClock">00:00:00</div>
+                    <div class="cashier-info">
+                        <img src="https://ui-avatars.com/api/?name=Thu+Ngan&background=f97316&color=fff" alt="Avatar">
+                        <span id="displayCashierName">Thu Ngân 01</span>
+                    </div>
+                </div>
+            </div>
+
+            <div class="main-content">
+                <div class="card" id="scan-section">
+                    <h2 style="margin-bottom: 20px; font-size: 20px;"><i class='bx bx-video-recording' style="color: red;"></i> Màn hình Camera AI</h2>
+                    <div class="camera-box" id="cameraBox">
+                        <video id="videoElement" autoplay playsinline></video>
+                        <div class="camera-overlay"></div>
+                    </div>
+                    <canvas id="hiddenCanvas" style="display: none;"></canvas>
+                    <button class="btn-main" id="btnScan" onclick="captureAndScan()">CHỤP VÀ TÍNH TIỀN <i class='bx bx-scan'></i></button>
+                </div>
+
+                <div class="card" id="result-section" style="display: none;">
+                    <h3 style="margin-bottom: 20px; font-size: 18px; border-bottom: 1px solid var(--border); padding-bottom: 10px;">Chi tiết nhận diện:</h3>
+                    <div id="cropGrid" class="crop-grid"></div>
+                    <h2 style="text-align:center; font-size: 18px; color: var(--text-secondary);">TỔNG TIỀN THANH TOÁN</h2>
+                    <div class="amount" id="billTotal">0 đ</div>
+                    <div class="qr-section">
+                        <img src="12.jpg" alt="Mã QR Thanh Toán" class="qr-img">
+                        <div class="qr-info">
+                            <h4>QUÉT MÃ THANH TOÁN</h4>
+                            <p>Khách hàng vui lòng dùng App Ngân hàng<br>quét mã QR để thanh toán tự động.</p>
+                        </div>
+                    </div>
+                    <button class="btn-main" style="background: #16a34a; margin-top: 30px;" onclick="resetApp()">HOÀN TẤT & QUÉT KHÁCH TIẾP THEO <i class='bx bx-check-circle'></i></button>
+                </div>
+            </div>
+
+        </div>
+    </div>
+
+<script>
+// ==========================================
+// LOGIC ĐĂNG NHẬP & CHUYỂN CẢNH MƯỢT MÀ
+// ==========================================
+function handleLogin(event) {
+    event.preventDefault(); 
+    
+    const username = document.getElementById('username').value;
+    document.getElementById('displayCashierName').innerText = username;
+    
+    const loginScreen = document.getElementById('loginScreen');
+    const appLayout = document.getElementById('appLayout');
+
+    // Fade out Login
+    loginScreen.style.opacity = '0';
+    
+    setTimeout(() => {
+        loginScreen.style.visibility = 'hidden'; 
+        appLayout.style.display = 'flex';
+        
+        setTimeout(() => {
+            appLayout.style.opacity = '1';
+            startCamera(); 
+        }, 50);
+    }, 500); 
+}
+
+function handleLogout() {
+    if (cameraStream) {
+        cameraStream.getTracks().forEach(track => track.stop());
+        cameraStream = null;
+    }
+    
+    const loginScreen = document.getElementById('loginScreen');
+    const appLayout = document.getElementById('appLayout');
+
+    appLayout.style.opacity = '0';
+    
+    setTimeout(() => {
+        appLayout.style.display = 'none';
+        document.getElementById('password').value = ''; 
+        
+        loginScreen.style.visibility = 'visible';
+        
+        setTimeout(() => {
+            loginScreen.style.opacity = '1';
+        }, 50);
+    }, 500);
+}
+
+// Đồng hồ thời gian thực
+setInterval(() => {
+    const now = new Date();
+    document.getElementById('realtimeClock').innerText = now.toLocaleTimeString('vi-VN');
+}, 1000);
+
+
+// ==========================================
+// LOGIC CAMERA VÀ AI (GIỮ NGUYÊN 100%)
+// ==========================================
+const video = document.getElementById('videoElement');
+const canvas = document.getElementById('hiddenCanvas');
+const ctx = canvas.getContext('2d');
+let cameraStream = null;
+
+async function startCamera() {
+    try {
+        cameraStream = await navigator.mediaDevices.getUserMedia({ 
+            video: { facingMode: 'environment', width: { ideal: 1280 }, height: { ideal: 960 } } 
+        });
+        video.srcObject = cameraStream;
+    } catch (err) {
+        alert("Lỗi truy cập Camera! " + err.message);
+    }
+}
+
+async function captureAndScan() {
+    if (!cameraStream) { alert("Camera chưa được bật!"); return; }
+
+    const btn = document.getElementById('btnScan');
+    btn.innerHTML = "ĐANG TÍNH TIỀN... <i class='bx bx-loader-alt bx-spin'></i>";
+    btn.disabled = true;
+    document.getElementById('cameraBox').classList.add('scanning');
+
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+    canvas.toBlob(async (blob) => {
+        let formData = new FormData();
+        formData.append("file", blob, "live_capture.jpg");
+
+        try {
+            const response = await fetch("http://localhost:8000/scan-khay", { method: "POST", body: formData });
+            const data = await response.json();
+            
+            if (!data.success) { alert("Lỗi AI: " + data.message); resetButtons(); return; }
+
+            document.getElementById('billTotal').innerText = data.total.toLocaleString('vi-VN') + ' đ';
+            
+            let gridHtml = "";
+            data.items.forEach(item => {
+                let imgSrc = `data:image/jpeg;base64,${item.image}`;
+                let titleColor = item.has_food ? "var(--text)" : "var(--text-secondary)";
+                let confColor = item.has_food ? "#166534" : "#b91c1c";
+                let priceHtml = item.has_food ? `<div class="crop-price">+${item.price.toLocaleString('vi-VN')} đ</div>` : "";
+
+                gridHtml += `
+                    <div class="crop-item">
+                        <img src="${imgSrc}" alt="Ngăn ${item.slot}">
+                        <div class="crop-title" style="color: ${titleColor};">${item.name}</div>
+                        <div class="crop-conf" style="color: ${confColor};">AI: ${item.conf}%</div>
+                        ${priceHtml}
+                    </div>
+                `;
+            });
+            document.getElementById('cropGrid').innerHTML = gridHtml;
+            
+            document.getElementById('scan-section').style.display = 'none';
+            document.getElementById('result-section').style.display = 'block';
+
+        } catch (err) {
+            alert("Không kết nối được với Server Python. Hãy đảm bảo file app.py đang chạy!");
+        }
+        resetButtons();
+    }, 'image/jpeg', 0.95);
+}
+
+function resetButtons() {
+    const btn = document.getElementById('btnScan');
+    btn.innerHTML = "CHỤP VÀ TÍNH TIỀN <i class='bx bx-scan'></i>";
+    btn.disabled = false;
+    document.getElementById('cameraBox').classList.remove('scanning');
+}
+
+function resetApp() {
+    document.getElementById('scan-section').style.display = 'block';
+    document.getElementById('result-section').style.display = 'none';
+}
+</script>
+</body>
+</html>
