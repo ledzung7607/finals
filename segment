@@ -1,0 +1,620 @@
+#!/usr/bin/env python3
+"""
+Segment food trays of a single fixed layout.
+
+Pipeline:
+1. Find the tray.
+2. Rotate the tray into a canonical orientation.
+3. Crop 5 fixed regions that match the tray compartments.
+
+This is intentionally specialized for the tray type in the example set.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+
+import cv2
+import numpy as np
+
+Box = tuple[int, int, int, int]
+
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+EMPTY_TRAY_SATURATION_THRESHOLD = 35.0
+EMPTY_TRAY_FOOD_DENSITY_THRESHOLD = 0.42
+TRAY_QUAD_INSET_RATIO = 0.025
+POST_WARP_TRAY_INSET = (0.03, 0.08, 0.03, 0.04)
+
+# Canonical tray layout after rotation:
+# 1 = soup (large left top)
+# 2 = rice (large right top)
+# 3 = small left bottom
+# 4 = small middle bottom
+# 5 = small right bottom
+CANONICAL_FOOD_BOXES: list[tuple[float, float, float, float]] = [
+    (0.04, 0.03, 0.52, 0.55),
+    (0.66, 0.03, 0.96, 0.55),
+    (0.03, 0.57, 0.33, 0.97),
+    (0.35, 0.57, 0.67, 0.97),
+    (0.66, 0.57, 0.97, 0.97),
+]
+CANONICAL_CROP_BOXES: list[tuple[float, float, float, float]] = [
+    (0.04, 0.06, 0.53, 0.56),
+    (0.66, 0.06, 0.95, 0.56),
+    (0.04, 0.59, 0.33, 0.97),
+    (0.35, 0.59, 0.67, 0.97),
+    (0.67, 0.59, 0.96, 0.97),
+]
+CANONICAL_HANDLE_BOX = (0.52, 0.08, 0.65, 0.53)
+CANONICAL_SMOOTH_BOXES: list[tuple[float, float, float, float]] = [
+    (0.11, 0.10, 0.39, 0.39),
+    (0.74, 0.12, 0.91, 0.39),
+    (0.10, 0.70, 0.25, 0.88),
+    (0.43, 0.70, 0.58, 0.87),
+    (0.76, 0.70, 0.90, 0.87),
+]
+CANONICAL_NON_FLOOR_BOXES: list[tuple[float, float, float, float]] = [
+    (0.42, 0.10, 0.63, 0.39),
+    (0.08, 0.44, 0.28, 0.63),
+    (0.72, 0.44, 0.94, 0.63),
+]
+
+
+def resize_keep_ratio(img: np.ndarray, max_side: int = 1400) -> tuple[np.ndarray, float]:
+    h, w = img.shape[:2]
+    scale = max_side / max(h, w)
+    if scale >= 1.0:
+        return img.copy(), 1.0
+    out = cv2.resize(img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
+    return out, scale
+
+
+def compute_local_std(gray: np.ndarray, sigma: float = 2.0) -> np.ndarray:
+    gray_f = gray.astype(np.float32)
+    mean = cv2.GaussianBlur(gray_f, (0, 0), sigma)
+    mean_sq = cv2.GaussianBlur(gray_f * gray_f, (0, 0), sigma)
+    return np.sqrt(np.maximum(mean_sq - mean * mean, 0.0))
+
+
+def build_metal_mask(img_bgr: np.ndarray) -> np.ndarray:
+    hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+
+    s = hsv[:, :, 1].astype(np.float32)
+    v = hsv[:, :, 2].astype(np.float32)
+    local_std = compute_local_std(gray, sigma=2.0)
+
+    metal = (s < 55) & (v > 70) & (local_std < 18)
+    mask = metal.astype(np.uint8) * 255
+
+    open_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    close_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, open_kernel, iterations=1)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, close_kernel, iterations=2)
+    return mask
+
+
+def build_food_mask(img_bgr: np.ndarray) -> np.ndarray:
+    hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+
+    s = hsv[:, :, 1].astype(np.float32)
+    v = hsv[:, :, 2].astype(np.float32)
+    local_std = compute_local_std(gray, sigma=2.0)
+
+    food = (s > 60) | ((local_std > 20) & (v < 245)) | ((v > 150) & (local_std > 18) & (s < 65))
+    mask = food.astype(np.uint8) * 255
+
+    open_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    close_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (13, 13))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, open_kernel, iterations=1)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, close_kernel, iterations=1)
+    return mask
+
+
+def build_smoothness_map(img_bgr: np.ndarray, sigma: float = 3.0) -> np.ndarray:
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    local_std = compute_local_std(gray, sigma=sigma)
+    smoothness = 255.0 - np.clip(local_std * 8.0, 0.0, 255.0)
+    return smoothness.astype(np.uint8)
+
+
+def tray_is_empty_like(tray_img: np.ndarray) -> bool:
+    hsv = cv2.cvtColor(tray_img, cv2.COLOR_BGR2HSV)
+    mean_saturation = float(hsv[:, :, 1].mean())
+    food_density = float((build_food_mask(tray_img) > 0).mean())
+    return (
+        mean_saturation < EMPTY_TRAY_SATURATION_THRESHOLD
+        and food_density < EMPTY_TRAY_FOOD_DENSITY_THRESHOLD
+    )
+
+
+def largest_component_bbox(mask: np.ndarray, min_area_ratio: float = 0.08) -> Box | None:
+    h, w = mask.shape[:2]
+    min_area = int(h * w * min_area_ratio)
+    num, _, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+
+    best: Box | None = None
+    best_area = -1
+    for i in range(1, num):
+        x, y, bw, bh, area = stats[i]
+        if area < min_area:
+            continue
+        if area > best_area:
+            best = (int(x), int(y), int(x + bw), int(y + bh))
+            best_area = int(area)
+    return best
+
+
+def map_box_back(box: Box, scale: float) -> Box:
+    if scale == 1.0:
+        return box
+    inv = 1.0 / scale
+    x0, y0, x1, y1 = box
+    return (
+        int(x0 * inv),
+        int(y0 * inv),
+        int(x1 * inv),
+        int(y1 * inv),
+    )
+
+
+def rotate_90(img: np.ndarray, turns: int) -> np.ndarray:
+    return np.ascontiguousarray(np.rot90(img, turns))
+
+
+def normalized_box_to_pixels(shape: tuple[int, int] | tuple[int, int, int], box: tuple[float, float, float, float]) -> Box:
+    h, w = shape[:2]
+    x0, y0, x1, y1 = box
+    return (
+        int(x0 * w),
+        int(y0 * h),
+        int(x1 * w),
+        int(y1 * h),
+    )
+
+
+def crop_box(img: np.ndarray, box: Box) -> np.ndarray:
+    x0, y0, x1, y1 = box
+    return img[y0:y1, x0:x1]
+
+
+def box_to_corners(box: Box) -> np.ndarray:
+    x0, y0, x1, y1 = box
+    return np.array(
+        [[x0, y0], [x1, y0], [x1, y1], [x0, y1]],
+        dtype=np.float32,
+    )
+
+
+def expand_box(box: Box, shape: tuple[int, int] | tuple[int, int, int], pad: int) -> Box:
+    h, w = shape[:2]
+    x0, y0, x1, y1 = box
+    return (
+        max(0, x0 - pad),
+        max(0, y0 - pad),
+        min(w, x1 + pad),
+        min(h, y1 + pad),
+    )
+
+
+def offset_box(box: Box, offset: Box) -> Box:
+    ox0, oy0, _, _ = offset
+    x0, y0, x1, y1 = box
+    return (x0 + ox0, y0 + oy0, x1 + ox0, y1 + oy0)
+
+
+def map_points_back(points: np.ndarray, scale: float) -> np.ndarray:
+    if scale == 1.0:
+        return points.astype(np.float32, copy=True)
+    return points.astype(np.float32) / scale
+
+
+def clamp_points(points: np.ndarray, shape: tuple[int, int] | tuple[int, int, int]) -> np.ndarray:
+    h, w = shape[:2]
+    out = points.astype(np.float32, copy=True)
+    out[:, 0] = np.clip(out[:, 0], 0, w - 1)
+    out[:, 1] = np.clip(out[:, 1], 0, h - 1)
+    return out
+
+
+def transform_points(points: np.ndarray, matrix: np.ndarray) -> np.ndarray:
+    reshaped = points.astype(np.float32).reshape(-1, 1, 2)
+    transformed = cv2.perspectiveTransform(reshaped, matrix.astype(np.float32))
+    return transformed.reshape(-1, 2)
+
+
+def order_quad_points(points: np.ndarray) -> np.ndarray:
+    pts = points.astype(np.float32)
+    sums = pts.sum(axis=1)
+    diffs = np.diff(pts, axis=1).reshape(-1)
+    tl = pts[np.argmin(sums)]
+    br = pts[np.argmax(sums)]
+    tr = pts[np.argmin(diffs)]
+    bl = pts[np.argmax(diffs)]
+    return np.array([tl, tr, br, bl], dtype=np.float32)
+
+
+def inset_quad(points: np.ndarray, factor: float) -> np.ndarray:
+    center = points.mean(axis=0, keepdims=True)
+    return center + (points - center) * (1.0 - factor)
+
+
+def build_warp_transform(quad: np.ndarray) -> tuple[np.ndarray, tuple[int, int]]:
+    tl, tr, br, bl = quad.astype(np.float32)
+    out_w = max(
+        1,
+        int(round(max(np.linalg.norm(br - bl), np.linalg.norm(tr - tl)))),
+    )
+    out_h = max(
+        1,
+        int(round(max(np.linalg.norm(tr - br), np.linalg.norm(tl - bl)))),
+    )
+    dst = np.array(
+        [[0, 0], [out_w - 1, 0], [out_w - 1, out_h - 1], [0, out_h - 1]],
+        dtype=np.float32,
+    )
+    matrix = cv2.getPerspectiveTransform(quad.astype(np.float32), dst)
+    return matrix, (out_w, out_h)
+
+
+def warp_from_quad(img: np.ndarray, quad: np.ndarray) -> np.ndarray:
+    matrix, size = build_warp_transform(quad)
+    return cv2.warpPerspective(img, matrix, size)
+
+
+def inverse_rotate_points(
+    points: np.ndarray,
+    src_shape: tuple[int, int] | tuple[int, int, int],
+    turns: int,
+) -> np.ndarray:
+    h, w = src_shape[:2]
+    out = points.astype(np.float32, copy=True)
+    x = points[:, 0].astype(np.float32)
+    y = points[:, 1].astype(np.float32)
+    mode = turns % 4
+    if mode == 0:
+        out[:, 0] = x
+        out[:, 1] = y
+    elif mode == 1:
+        out[:, 0] = w - y
+        out[:, 1] = x
+    elif mode == 2:
+        out[:, 0] = w - x
+        out[:, 1] = h - y
+    else:
+        out[:, 0] = y
+        out[:, 1] = h - x
+    return out
+
+
+def points_to_axis_aligned_box(
+    points: np.ndarray,
+    shape: tuple[int, int] | tuple[int, int, int],
+) -> Box:
+    h, w = shape[:2]
+    x0 = max(0, min(w - 1, int(np.floor(points[:, 0].min()))))
+    y0 = max(0, min(h - 1, int(np.floor(points[:, 1].min()))))
+    x1 = max(x0 + 1, min(w, int(np.ceil(points[:, 0].max()))))
+    y1 = max(y0 + 1, min(h, int(np.ceil(points[:, 1].max()))))
+    return (x0, y0, x1, y1)
+
+
+def fractional_frame_box(
+    shape: tuple[int, int] | tuple[int, int, int],
+    inset: tuple[float, float, float, float],
+) -> Box:
+    left, top, right, bottom = inset
+    h, w = shape[:2]
+    x0 = max(0, min(w - 1, int(round(left * w))))
+    y0 = max(0, min(h - 1, int(round(top * h))))
+    x1 = max(x0 + 1, min(w, int(round((1.0 - right) * w))))
+    y1 = max(y0 + 1, min(h, int(round((1.0 - bottom) * h))))
+    return (x0, y0, x1, y1)
+
+
+def crop_fractional_frame(
+    img: np.ndarray,
+    inset: tuple[float, float, float, float],
+) -> np.ndarray:
+    return crop_box(img, fractional_frame_box(img.shape, inset))
+
+
+def overlay_boxes(img: np.ndarray, boxes: list[Box]) -> np.ndarray:
+    vis = img.copy()
+    for i, (x0, y0, x1, y1) in enumerate(boxes, start=1):
+        draw_x1 = max(x0, x1 - 1)
+        draw_y1 = max(y0, y1 - 1)
+        cv2.rectangle(vis, (x0, y0), (draw_x1, draw_y1), (0, 255, 0), 3)
+        cv2.putText(
+            vis,
+            str(i),
+            (x0 + 8, y0 + 28),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            1.0,
+            (0, 255, 0),
+            2,
+            cv2.LINE_AA,
+        )
+    return vis
+
+
+def tray_bbox_from_image(img_bgr: np.ndarray, max_side: int = 1400) -> tuple[np.ndarray, float, Box]:
+    small, scale = resize_keep_ratio(img_bgr, max_side=max_side)
+    tray_box_small = largest_component_bbox(build_metal_mask(small), min_area_ratio=0.08)
+    if tray_box_small is None:
+        tray_box_small = (0, 0, small.shape[1], small.shape[0])
+    return small, scale, tray_box_small
+
+
+def detect_tray_quad(tray_img: np.ndarray) -> np.ndarray | None:
+    gray = cv2.cvtColor(tray_img, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    edges = cv2.Canny(blur, 60, 160)
+    edges = cv2.dilate(edges, np.ones((3, 3), dtype=np.uint8), iterations=2)
+    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    h, w = gray.shape
+    best_rect = None
+    best_score = float("-inf")
+    for contour in contours:
+        rect = cv2.minAreaRect(contour)
+        (_, _), (rw, rh), _ = rect
+        area = rw * rh
+        if area < float(h * w) * 0.45:
+            continue
+
+        aspect = max(rw, rh) / max(1e-6, min(rw, rh))
+        if aspect > 1.8:
+            continue
+
+        quad = cv2.boxPoints(rect)
+        xs = quad[:, 0]
+        ys = quad[:, 1]
+        touches_border = np.mean((xs < 3) | (xs > w - 3) | (ys < 3) | (ys > h - 3))
+        score = area - float(touches_border) * 50000.0
+        if score > best_score:
+            best_score = score
+            best_rect = rect
+
+    if best_rect is None:
+        return None
+
+    return order_quad_points(cv2.boxPoints(best_rect))
+
+
+def refine_empty_tray_bbox(tray_img: np.ndarray) -> Box:
+    gray = cv2.cvtColor(tray_img, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    edges = cv2.Canny(blur, 60, 150)
+    edges = cv2.dilate(edges, np.ones((3, 3), dtype=np.uint8), iterations=1)
+    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    h, w = gray.shape
+    best: Box | None = None
+    best_area = -1
+    for contour in contours:
+        x, y, bw, bh = cv2.boundingRect(contour)
+        area = bw * bh
+        if area < int(h * w * 0.35):
+            continue
+        aspect = bw / bh if bh else 0.0
+        if not 0.75 <= aspect <= 1.8:
+            continue
+        if area > best_area:
+            best = (int(x), int(y), int(x + bw), int(y + bh))
+            best_area = int(area)
+
+    if best is None:
+        return (0, 0, w, h)
+
+    pad = max(6, int(min(h, w) * 0.012))
+    return expand_box(best, tray_img.shape, pad)
+
+
+def score_canonical_rotation(tray_img: np.ndarray) -> tuple[float, np.ndarray]:
+    food_mask = (build_food_mask(tray_img) > 0).astype(np.float32)
+    values: list[float] = []
+    for box in CANONICAL_FOOD_BOXES:
+        roi = crop_box(food_mask, normalized_box_to_pixels(food_mask.shape, box))
+        values.append(float(roi.mean()) if roi.size else 0.0)
+
+    handle_roi = crop_box(food_mask, normalized_box_to_pixels(food_mask.shape, CANONICAL_HANDLE_BOX))
+    handle_value = float(handle_roi.mean()) if handle_roi.size else 0.0
+
+    score = sum(values) - 2.2 * handle_value
+    return score, food_mask
+
+
+def score_empty_tray_rotation(tray_img: np.ndarray) -> tuple[float, np.ndarray]:
+    smoothness = build_smoothness_map(tray_img)
+    values: list[float] = []
+    for box in CANONICAL_SMOOTH_BOXES:
+        roi = crop_box(smoothness, normalized_box_to_pixels(smoothness.shape, box))
+        values.append(float(roi.mean()) if roi.size else 0.0)
+
+    penalties: list[float] = []
+    for box in CANONICAL_NON_FLOOR_BOXES:
+        roi = crop_box(smoothness, normalized_box_to_pixels(smoothness.shape, box))
+        penalties.append(float(roi.mean()) if roi.size else 0.0)
+
+    score = sum(values) - 1.3 * sum(penalties)
+    return score, smoothness
+
+
+def choose_rotation(tray_small: np.ndarray) -> tuple[int, np.ndarray]:
+    best_turns = 0
+    best_score = float("-inf")
+    best_mask = np.zeros(tray_small.shape[:2], dtype=np.uint8)
+    use_geometry = tray_is_empty_like(tray_small)
+    landscape_results: list[tuple[int, float, np.ndarray]] = []
+    all_results: list[tuple[int, float, np.ndarray]] = []
+
+    for turns in range(4):
+        rotated = rotate_90(tray_small, turns)
+        if use_geometry:
+            score, debug_mask = score_empty_tray_rotation(rotated)
+        else:
+            score, food_mask = score_canonical_rotation(rotated)
+            debug_mask = (food_mask * 255).astype(np.uint8)
+
+        result = (turns, score, debug_mask)
+        all_results.append(result)
+        if rotated.shape[1] >= rotated.shape[0]:
+            landscape_results.append(result)
+
+    candidates = landscape_results or all_results
+    for turns, score, debug_mask in candidates:
+        if score > best_score:
+            best_score = score
+            best_turns = turns
+            best_mask = debug_mask
+
+    return best_turns, best_mask
+
+
+def extract_food_crops(
+    img_bgr: np.ndarray,
+    max_side: int = 1400,
+) -> tuple[list[np.ndarray], np.ndarray, np.ndarray, np.ndarray, list[Box]]:
+    small, scale, tray_box_small = tray_bbox_from_image(img_bgr, max_side=max_side)
+    tray_small = crop_box(small, tray_box_small)
+
+    tray_box = map_box_back(tray_box_small, scale)
+    tray_big = crop_box(img_bgr, tray_box)
+    warp_matrix_big: np.ndarray | None = None
+
+    tray_quad_small = detect_tray_quad(tray_small)
+    if tray_quad_small is not None:
+        tray_quad_small = clamp_points(inset_quad(tray_quad_small, TRAY_QUAD_INSET_RATIO), tray_small.shape)
+        tray_quad_big = clamp_points(map_points_back(tray_quad_small, scale), tray_big.shape)
+        tray_small = warp_from_quad(tray_small, tray_quad_small)
+        warp_matrix_big, warp_size_big = build_warp_transform(tray_quad_big)
+        tray_big = cv2.warpPerspective(tray_big, warp_matrix_big, warp_size_big)
+
+    pre_rotate_big_shape = tray_big.shape
+
+    turns, debug_mask = choose_rotation(tray_small)
+    canonical_small = rotate_90(tray_small, turns)
+    canonical_big = rotate_90(tray_big, turns)
+
+    frame_box = fractional_frame_box(canonical_big.shape, POST_WARP_TRAY_INSET)
+    canonical_small = crop_fractional_frame(canonical_small, POST_WARP_TRAY_INSET)
+    canonical_big = crop_box(canonical_big, frame_box)
+    debug_mask = crop_fractional_frame(debug_mask, POST_WARP_TRAY_INSET)
+
+    boxes_small = [normalized_box_to_pixels(canonical_small.shape, box) for box in CANONICAL_CROP_BOXES]
+    boxes_big = [normalized_box_to_pixels(canonical_big.shape, box) for box in CANONICAL_CROP_BOXES]
+
+    crops = [crop_box(canonical_big, box) for box in boxes_big]
+    original_boxes: list[Box] = []
+    for box in boxes_big:
+        corners = box_to_corners(box)
+        corners[:, 0] += frame_box[0]
+        corners[:, 1] += frame_box[1]
+        corners = inverse_rotate_points(corners, pre_rotate_big_shape, turns)
+        if warp_matrix_big is not None:
+            corners = transform_points(corners, np.linalg.inv(warp_matrix_big))
+        corners[:, 0] += tray_box[0]
+        corners[:, 1] += tray_box[1]
+        original_boxes.append(points_to_axis_aligned_box(corners, img_bgr.shape))
+
+    debug_boxed = overlay_boxes(canonical_small, boxes_small)
+    original_boxed = overlay_boxes(img_bgr, original_boxes)
+    return crops, debug_boxed, debug_mask, original_boxed, original_boxes
+
+
+def save_bbox_json(boxes: list[Box], out_path: Path) -> None:
+    payload = [
+        {
+            "label": idx,
+            "x0": x0,
+            "y0": y0,
+            "x1": x1,
+            "y1": y1,
+            "width": x1 - x0,
+            "height": y1 - y0,
+        }
+        for idx, (x0, y0, x1, y1) in enumerate(boxes, start=1)
+    ]
+    out_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def read_image_unicode_safe(path: Path) -> np.ndarray | None:
+    try:
+        data = np.fromfile(path, dtype=np.uint8)
+    except OSError:
+        return None
+    if data.size == 0:
+        return None
+    return cv2.imdecode(data, cv2.IMREAD_COLOR)
+
+
+def write_image_unicode_safe(path: Path, image: np.ndarray) -> bool:
+    suffix = path.suffix or ".png"
+    ok, encoded = cv2.imencode(suffix, image)
+    if not ok:
+        return False
+    try:
+        encoded.tofile(path)
+    except OSError:
+        return False
+    return True
+
+
+def save_crops(crops: list[np.ndarray], outdir: Path, prefix: str = "food") -> None:
+    outdir.mkdir(parents=True, exist_ok=True)
+    for idx, crop in enumerate(crops, start=1):
+        write_image_unicode_safe(outdir / f"{prefix}_{idx:02d}.png", crop)
+
+
+def process_single_image(in_path: Path, outdir: Path, max_side: int = 1400) -> int:
+    img = read_image_unicode_safe(in_path)
+    if img is None:
+        raise SystemExit(f"Cannot read image: {in_path}")
+
+    crops, debug_boxed, debug_mask, original_boxed, original_boxes = extract_food_crops(img, max_side=max_side)
+
+    save_crops(crops, outdir)
+    debug_dir = outdir / "debug"
+    debug_dir.mkdir(parents=True, exist_ok=True)
+    write_image_unicode_safe(debug_dir / "detected_boxes.png", debug_boxed)
+    write_image_unicode_safe(debug_dir / "mask.png", debug_mask)
+    write_image_unicode_safe(debug_dir / "original_bboxes.png", original_boxed)
+    save_bbox_json(original_boxes, debug_dir / "bboxes.json")
+
+    return len(crops)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--input", required=True, help="Input image path or directory")
+    parser.add_argument("--outdir", default="crops", help="Output folder")
+    parser.add_argument("--max-side", type=int, default=1400, help="Resize max side for tray detection")
+    args = parser.parse_args()
+
+    in_path = Path(args.input)
+    outdir = Path(args.outdir)
+
+    if in_path.is_dir():
+        files = sorted(p for p in in_path.iterdir() if p.is_file() and p.suffix.lower() in IMAGE_EXTS)
+        if not files:
+            raise SystemExit(f"No supported images found in: {in_path}")
+
+        for file_path in files:
+            file_outdir = outdir / file_path.stem
+            count = process_single_image(file_path, file_outdir, max_side=args.max_side)
+            print(f"{file_path.name}: {count} food regions")
+        print(f"Batch results saved to: {outdir.resolve()}")
+        return
+
+    count = process_single_image(in_path, outdir, max_side=args.max_side)
+    print(f"Found {count} food regions")
+    print(f"Crops saved to: {outdir.resolve()}")
+    print(f"Debug files: {(outdir / 'debug').resolve()}")
+
+
+if __name__ == "__main__":
+    main()
